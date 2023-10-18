@@ -27,7 +27,7 @@ predicate trans(0..maxE: from, 0..maxE: to) =
   } in 
     ((curr_link /\ ncje == e)
       \/ (prev_link /\ ncje == e-1)
-      \/ (ncje =- cje))
+      \/ (ncje == cje))
     /\ npje == cje /\ ne == e + 1
 ;
 
