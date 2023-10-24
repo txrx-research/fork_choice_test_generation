@@ -3,46 +3,43 @@ from typing import Any, FrozenSet, Mapping, Dict, Sequence, Optional, List as Py
 
 from frozendict import frozendict
 
-from beacon_chain import uint64, Gwei, Root, Slot, Epoch, ValidatorIndex, Checkpoint
-from beacon_chain import AttestationData, Attestation, IndexedAttestation, Validator, IBeaconState, SignedBeaconBlock, \
-    BeaconBlock, AttesterSlashing
-from beacon_chain import SECONDS_PER_SLOT, SLOTS_PER_EPOCH, GENESIS_SLOT, GENESIS_EPOCH
-from beacon_chain import compute_epoch_at_slot, compute_start_slot_at_epoch, is_slashable_attestation_data, \
-    is_valid_indexed_attestation, get_indexed_attestation, get_current_epoch, state_transition as bc_state_transition, \
-    process_justification_and_finalization as bc_process_justification_and_finalization, \
-    process_slots as bc_process_slots, get_active_validator_indices, get_total_active_balance
-from utils import hash_tree_root
-
-from orig_spec import LatestMessage
-from orig_spec import INTERVALS_PER_SLOT, PROPOSER_SCORE_BOOST
-
+from eth2spec.phase0 import minimal as phase0
+from eth2spec.phase0.minimal import config
+from eth2spec.phase0.minimal import Slot, Epoch, Root, uint64, ValidatorIndex, Gwei
+from eth2spec.phase0.minimal import Checkpoint, BeaconState, SignedBeaconBlock, BeaconBlock, Attestation, AttesterSlashing
+from eth2spec.phase0.minimal import Store, LatestMessage
+from eth2spec.phase0.minimal import hash_tree_root
+from eth2spec.phase0.minimal import (process_slots as bc_process_slots, state_transition as bc_state_transition,
+                                     process_justification_and_finalization as bc_process_justification_and_finalization,
+                                     get_current_epoch, compute_start_slot_at_epoch
+                                     )
 
 def requires(precondition):
     return lambda f: f
 
 
-def process_slots_pure(state: IBeaconState, slot: Slot) -> IBeaconState:
-    state = state.unfreeze()
+def process_slots_pure(state: BeaconState, slot: Slot) -> BeaconState:
+    state = state.copy()
     bc_process_slots(state, slot)
-    return state.freeze()
+    return state
 
 
-def state_transition_pure(state: IBeaconState, signed_block: SignedBeaconBlock, validate_result: bool=True) -> IBeaconState:
-    state = state.unfreeze()
+def state_transition_pure(state: BeaconState, signed_block: SignedBeaconBlock, validate_result: bool=True) -> BeaconState:
+    state = state.copy()
     bc_state_transition(state, signed_block, validate_result)
-    return state.freeze()
+    return state
 
 
-def process_justification_and_finalization_pure(state: IBeaconState) -> IBeaconState:
-    state = state.unfreeze()
+def process_justification_and_finalization_pure(state: BeaconState) -> BeaconState:
+    state = state.copy()
     bc_process_justification_and_finalization(state)
-    return state.freeze()
+    return state
 
 
 @dataclass(eq=True,frozen=True)
 class FCState(object):
     anchor_root: Root
-    anchor_state: IBeaconState
+    anchor_state: BeaconState
     time: uint64
     genesis_time: uint64
     proposer_boost_root: Root
@@ -51,7 +48,7 @@ class FCState(object):
     latest_messages: Mapping[ValidatorIndex, LatestMessage]
 
     def get_anchor_checkpoint(self) -> Checkpoint:
-        return Checkpoint(get_current_epoch(self.get_block_state(self.anchor_root).unfreeze()), self.anchor_root)
+        return Checkpoint(get_current_epoch(self.get_block_state(self.anchor_root)), self.anchor_root)
 
     def find_block(self, block_root: Root) -> Optional[BeaconBlock]:
         for block in self.blocks:
@@ -67,7 +64,7 @@ class FCState(object):
     def has_block(self, block_root: Root) -> bool:
         return self.find_block(block_root) is not None
 
-    def get_block_state(self, block_root: Root) -> IBeaconState:
+    def get_block_state(self, block_root: Root) -> BeaconState:
         if block_root == self.anchor_root:
             return self.anchor_state
         else:
@@ -75,7 +72,7 @@ class FCState(object):
             parent_state = self.get_block_state(block.parent_root)
             return state_transition_pure(parent_state, SignedBeaconBlock(block), False)
 
-    def get_checkpoint_state(self, target: Checkpoint) -> IBeaconState:
+    def get_checkpoint_state(self, target: Checkpoint) -> BeaconState:
         base_state = self.get_block_state(target.root)
         if base_state.slot < compute_start_slot_at_epoch(target.epoch):
             process_slots_pure(base_state, compute_start_slot_at_epoch(target.epoch))
@@ -108,15 +105,15 @@ def is_previous_epoch_justified(store: FCState) -> bool:
     return store.get_justified_checkpoint().epoch + 1 == current_epoch
 
 
-def get_forkchoice_state(anchor_state: IBeaconState, anchor_block: BeaconBlock) -> FCState:
-    assert isinstance(anchor_state, IBeaconState)
+def get_forkchoice_state(anchor_state: BeaconState, anchor_block: BeaconBlock) -> FCState:
+    assert isinstance(anchor_state, BeaconState)
     assert anchor_block.state_root == hash_tree_root(anchor_state)
     anchor_root = hash_tree_root(anchor_block)
     proposer_boost_root = Root()
     return FCState(
         anchor_root=anchor_root,
         anchor_state=anchor_state,
-        time=uint64(anchor_state.genesis_time + SECONDS_PER_SLOT * anchor_state.slot),
+        time=uint64(anchor_state.genesis_time + config.SECONDS_PER_SLOT * anchor_state.slot),
         genesis_time=anchor_state.genesis_time,
         proposer_boost_root=proposer_boost_root,
         equivocating_indices=frozenset(),
@@ -126,11 +123,11 @@ def get_forkchoice_state(anchor_state: IBeaconState, anchor_block: BeaconBlock) 
 
 
 def get_slots_since_genesis(store: FCState) -> int:
-    return (store.time - store.genesis_time) // SECONDS_PER_SLOT
+    return (store.time - store.genesis_time) // config.SECONDS_PER_SLOT
 
 
 def get_current_slot(store: FCState) -> Slot:
-    return Slot(GENESIS_SLOT + get_slots_since_genesis(store))
+    return Slot(config.GENESIS_SLOT + get_slots_since_genesis(store))
 
 
 def compute_slots_since_epoch_start(slot: Slot) -> int:
@@ -172,17 +169,17 @@ def get_weight(store: FCState, root: Root) -> Gwei:
     proposer_score = Gwei(0)
     # Boost is applied if ``root`` is an ancestor of ``proposer_boost_root``
     if get_ancestor(store, store.proposer_boost_root, store.get_block(root).slot) == root:
-        committee_weight = get_total_active_balance(state) // SLOTS_PER_EPOCH
-        proposer_score = (committee_weight * PROPOSER_SCORE_BOOST) // 100
+        committee_weight = get_total_active_balance(state) // config.SLOTS_PER_EPOCH
+        proposer_score = (committee_weight * config.PROPOSER_SCORE_BOOST) // 100
     return attestation_score + proposer_score
 
 
-def get_next_epoch_state(store: FCState, block_root: Root) -> IBeaconState:
+def get_next_epoch_state(store: FCState, block_root: Root) -> BeaconState:
     state = store.get_block_state(block_root)
     return process_justification_and_finalization_pure(state)
 
 
-def get_actual_state(store: FCState, block_root: Root) -> IBeaconState:
+def get_actual_state(store: FCState, block_root: Root) -> BeaconState:
     """
     Compute the voting source checkpoint in event that block with root ``block_root`` is the head block
     """
@@ -226,7 +223,7 @@ def filter_block_tree(store: FCState, block_root: Root, blocks: Dict[Root, Beaco
 
     # The voting source should be at the same height as the store's justified checkpoint
     correct_justified = (
-            store.get_justified_checkpoint().epoch == GENESIS_EPOCH
+            store.get_justified_checkpoint().epoch == config.GENESIS_EPOCH
             or voting_source.epoch == store.get_justified_checkpoint().epoch
     )
 
