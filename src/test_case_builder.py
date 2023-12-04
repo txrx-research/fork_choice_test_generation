@@ -1,0 +1,195 @@
+from dataclasses import dataclass, replace
+from typing import Any, Sequence, Set, Tuple, Dict, Optional
+
+
+from eth2spec.test.helpers import genesis, block as block_helpers, attestations as attestations_helper
+
+from eth2spec.phase0 import minimal as phase0
+from eth2spec.phase0.minimal import config, MAX_EFFECTIVE_BALANCE, GENESIS_SLOT, GENESIS_EPOCH
+from eth2spec.phase0.minimal import (Store, LatestMessage, Attestation, AttesterSlashing, BeaconState,
+                                     SignedBeaconBlock, BeaconBlock, Validator, Checkpoint, BeaconBlockBody,
+                                     AttestationData, Hash32, Root)
+from eth2spec.phase0.minimal import (get_head, get_filtered_block_tree, get_weight, on_tick, on_block, on_attestation,
+                                     on_attester_slashing, get_forkchoice_store, get_current_slot, state_transition,
+                                     process_slots, get_beacon_proposer_index, compute_epoch_at_slot,
+                                     get_checkpoint_block, get_voting_source, is_previous_epoch_justified,
+                                     get_current_epoch, get_active_validator_indices
+                                     )
+from eth2spec.phase0.minimal import hash_tree_root
+
+
+def do_spec_step(store, evt):
+    match evt:
+        case int(time):
+            on_tick(store, time)
+        case Attestation() as attestation:
+            on_attestation(store, attestation, False)
+        case SignedBeaconBlock() as signed_block:
+            on_block(store, signed_block)
+        case AttesterSlashing() as attester_slashing:
+            on_attester_slashing(store, attester_slashing)
+        case _:
+            assert False
+
+
+def mk_anchor():
+    no_validators = 16
+    anchor_state = genesis.create_genesis_state(phase0, [MAX_EFFECTIVE_BALANCE] * no_validators, 0)
+    anchor_block = BeaconBlock(state_root=hash_tree_root(anchor_state))
+    return anchor_state, anchor_block
+
+
+
+
+@dataclass(eq=True)
+class TC:
+    anchor: Tuple[BeaconState, BeaconBlock]
+    events: Sequence[int|SignedBeaconBlock|Attestation|AttesterSlashing]
+
+
+class TCBuilder:
+    def __init__(self):
+        self.anchor = mk_anchor()
+        self.events = []
+        self.store = get_forkchoice_store(*self.anchor)
+        self.attestations = []
+        self.pending_atts = []
+
+    def get_tc(self):
+        assert len(self.pending_atts) == 0
+        return TC(self.anchor, self.events)
+
+    def new_slot(self):
+        slot = get_current_slot(self.store)
+        tick = self.store.genesis_time + config.SECONDS_PER_SLOT*(slot - GENESIS_SLOT + 1)
+        do_spec_step(self.store, tick)
+        self.events.append(tick)
+        if self.pending_atts:
+            atts = self.pending_atts[:]
+            self.pending_atts.clear()
+            for a in atts:
+                self.send_attestation(a)
+
+    def _get_last_block(self):
+        return max(self.store.blocks.values(), key=lambda b: b.slot)
+
+    def _resolve_block_ref(self, ref):
+        if ref is None:
+            return get_head(self.store)
+        elif isinstance(ref, BeaconBlock):
+            return hash_tree_root(ref)
+        elif isinstance(ref, SignedBeaconBlock):
+            return self._resolve_block_ref(ref.message)
+        elif isinstance(ref, int):
+            for root, block in self.store.blocks.items():
+                if block.slot == ref:
+                    return root
+            assert False
+        elif isinstance(ref, Root):
+            return ref
+        else:
+            assert False
+
+    def send_block(self, signed_block):
+        do_spec_step(self.store, signed_block)
+        self.events.append(signed_block)
+
+    def mk_block(self, parent=None, atts=None):
+        parent_root = self._resolve_block_ref(parent)
+        slot = get_current_slot(self.store)
+        state = self.store.block_states[parent_root].copy()
+        block = block_helpers.build_empty_block(phase0, state, slot)
+        if atts is not None:
+            for a in atts:
+                block.body.attestations.append(a)
+        else:
+            st = state.copy()
+            phase0.process_slots(st, slot)
+            selected_atts = []
+            for a in self.attestations:
+                assert isinstance(a, phase0.Attestation)
+                if (a.data.source == st.current_justified_checkpoint
+                    or a.data.source == st.previous_justified_checkpoint) \
+                        and (a.data.slot + phase0.MIN_ATTESTATION_INCLUSION_DELAY <= slot <= a.data.slot + phase0.SLOTS_PER_EPOCH):
+                    selected_atts.append(a)
+            for a in selected_atts:
+                block.body.attestations.append(a)
+
+
+        block = block_helpers.transition_unsigned_block(phase0, state, block)
+        block.state_root = hash_tree_root(state)
+        signed_block = block_helpers.sign_block(phase0, state, block)
+        return signed_block
+
+    def new_block(self, parent=None, atts=None):
+        self.send_block(self.mk_block(parent, atts))
+
+    # def mk_attestation(self, vals):
+    #     head = self._resolve_block_ref(None)
+    #     slot = get_current_slot(self.store)
+    #     epoch = compute_epoch_at_slot(slot)
+    #     source = self.store.justified_checkpoint
+    #     boundary_block = get_checkpoint_block(self.store, head, epoch)
+    #     data = AttestationData(
+    #         slot = slot, beacon_block_root=head, source=source,
+    #         target=Checkpoint(epoch=epoch, root=boundary_block))
+    #     return Attestation(data=data)
+
+    def mk_attestations(self):
+        head_root = self._resolve_block_ref(None)
+        slot = get_current_slot(self.store)
+        state = self.store.block_states[head_root].copy()
+        if state.slot < slot:
+            phase0.process_slots(state, slot)
+
+        block_root = head_root
+        current_epoch_start_slot = phase0.compute_start_slot_at_epoch(phase0.get_current_epoch(state))
+        if slot < current_epoch_start_slot:
+            epoch_boundary_root = phase0.get_block_root(state, phase0.get_previous_epoch(state))
+        elif slot == current_epoch_start_slot:
+            epoch_boundary_root = block_root
+        else:
+            epoch_boundary_root = phase0.get_block_root(state, phase0.get_current_epoch(state))
+
+        if slot < current_epoch_start_slot:
+            source_epoch = state.previous_justified_checkpoint.epoch
+            source_root = state.previous_justified_checkpoint.root
+        else:
+            source_epoch = state.current_justified_checkpoint.epoch
+            source_root = state.current_justified_checkpoint.root
+
+        attestation_data = phase0.AttestationData(
+            slot=slot,
+            index=0,
+            beacon_block_root=block_root,
+            source=phase0.Checkpoint(epoch=source_epoch, root=source_root),
+            target=phase0.Checkpoint(epoch=phase0.compute_epoch_at_slot(slot), root=epoch_boundary_root),
+        )
+
+
+        beacon_committee = phase0.get_beacon_committee(
+            state,
+            attestation_data.slot,
+            attestation_data.index,
+        )
+
+        committee_size = len(beacon_committee)
+        aggregation_bits = phase0.Bitlist[phase0.MAX_VALIDATORS_PER_COMMITTEE](*([0] * committee_size))
+        attestation = phase0.Attestation(
+            aggregation_bits=aggregation_bits,
+            data=attestation_data,
+        )
+        attestations_helper.fill_aggregate_attestation(phase0, state, attestation, signed=False, filter_participant_set=None)
+
+        atts = attestation
+        return atts
+
+    def send_attestation(self, att):
+        if att.data.slot + 1 <= get_current_slot(self.store):
+            do_spec_step(self.store, att)
+            self.attestations.append(att)
+            self.events.append(att)
+        else:
+            self.pending_atts.append(att)
+
+

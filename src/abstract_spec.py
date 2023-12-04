@@ -1,18 +1,28 @@
+import functools
 from dataclasses import dataclass, field, replace
-from typing import Any, FrozenSet, Mapping, Dict, Sequence, Optional, List as PyList
+from typing import Any, FrozenSet, Mapping, Dict, Sequence, Optional, Set, List as PyList
+from functools import cache
 
 from frozendict import frozendict
 
 from eth2spec.phase0 import minimal as phase0
 from eth2spec.phase0.minimal import config
+from eth2spec.phase0.minimal import GENESIS_SLOT, GENESIS_EPOCH, INTERVALS_PER_SLOT, SLOTS_PER_EPOCH
 from eth2spec.phase0.minimal import Slot, Epoch, Root, uint64, ValidatorIndex, Gwei
 from eth2spec.phase0.minimal import Checkpoint, BeaconState, SignedBeaconBlock, BeaconBlock, Attestation, AttesterSlashing
 from eth2spec.phase0.minimal import Store, LatestMessage
 from eth2spec.phase0.minimal import hash_tree_root
 from eth2spec.phase0.minimal import (process_slots as bc_process_slots, state_transition as bc_state_transition,
                                      process_justification_and_finalization as bc_process_justification_and_finalization,
-                                     get_current_epoch, compute_start_slot_at_epoch
+                                     get_current_epoch, compute_start_slot_at_epoch, compute_epoch_at_slot,
+                                     get_active_validator_indices, get_total_active_balance,
+                                     get_indexed_attestation, is_valid_indexed_attestation, is_slashable_attestation_data
                                      )
+
+
+block_state_cache = {}
+state_transition_cache = {}
+
 
 def requires(precondition):
     return lambda f: f
@@ -48,7 +58,7 @@ class FCState(object):
     latest_messages: Mapping[ValidatorIndex, LatestMessage]
 
     def get_anchor_checkpoint(self) -> Checkpoint:
-        return Checkpoint(get_current_epoch(self.get_block_state(self.anchor_root)), self.anchor_root)
+        return Checkpoint(epoch=get_current_epoch(self.get_block_state(self.anchor_root)), root=self.anchor_root)
 
     def find_block(self, block_root: Root) -> Optional[BeaconBlock]:
         for block in self.blocks:
@@ -65,12 +75,16 @@ class FCState(object):
         return self.find_block(block_root) is not None
 
     def get_block_state(self, block_root: Root) -> BeaconState:
+        if block_root in block_state_cache:
+            return block_state_cache[block_root]
         if block_root == self.anchor_root:
-            return self.anchor_state
+            res = self.anchor_state
         else:
             block = self.get_block(block_root)
             parent_state = self.get_block_state(block.parent_root)
-            return state_transition_pure(parent_state, SignedBeaconBlock(block), False)
+            res = state_transition_pure(parent_state, SignedBeaconBlock(message=block), False)
+        block_state_cache[block_root] = res
+        return res
 
     def get_checkpoint_state(self, target: Checkpoint) -> BeaconState:
         base_state = self.get_block_state(target.root)
@@ -87,7 +101,11 @@ class FCState(object):
             if block_root == self.anchor_root:
                 return self.get_anchor_checkpoint()
             else:
-                return get_actual_state(self, block_root).current_justified_checkpoint
+                checkpoint = get_actual_state(self, block_root).current_justified_checkpoint
+                if checkpoint.epoch == 0:
+                    return self.get_anchor_checkpoint()
+                else:
+                    return checkpoint
         return max((get_vs(hash_tree_root(block)) for block in self.blocks), key=lambda ch: ch.epoch)
 
     def get_finalized_checkpoint(self) -> Checkpoint:
@@ -95,7 +113,11 @@ class FCState(object):
             if block_root == self.anchor_root:
                 return self.get_anchor_checkpoint()
             else:
-                return get_actual_state(self, block_root).finalized_checkpoint
+                checkpoint = get_actual_state(self, block_root).finalized_checkpoint
+                if checkpoint.epoch == 0:
+                    return self.get_anchor_checkpoint()
+                else:
+                    return checkpoint
         return max((get_fin_chkpt(hash_tree_root(block)) for block in self.blocks), key=lambda ch: ch.epoch)
 
 
@@ -127,7 +149,7 @@ def get_slots_since_genesis(store: FCState) -> int:
 
 
 def get_current_slot(store: FCState) -> Slot:
-    return Slot(config.GENESIS_SLOT + get_slots_since_genesis(store))
+    return Slot(GENESIS_SLOT + get_slots_since_genesis(store))
 
 
 def compute_slots_since_epoch_start(slot: Slot) -> int:
@@ -149,12 +171,7 @@ def get_checkpoint_block(store: FCState, root: Root, epoch: Epoch) -> Root:
     return get_ancestor(store, root, epoch_first_slot)
 
 
-def get_weight(store: FCState, root: Root) -> Gwei:
-    state = store.get_checkpoint_state(store.get_justified_checkpoint())
-    unslashed_and_active_indices = [
-        i for i in get_active_validator_indices(state, get_current_epoch(state))
-        if not state.validators[i].slashed
-    ]
+def get_weight(store: FCState, state: BeaconState, unslashed_and_active_indices: Sequence[ValidatorIndex], root: Root) -> Gwei:
     attestation_score = Gwei(sum(
         state.validators[i].effective_balance for i in unslashed_and_active_indices
         if (i in store.latest_messages
@@ -169,7 +186,7 @@ def get_weight(store: FCState, root: Root) -> Gwei:
     proposer_score = Gwei(0)
     # Boost is applied if ``root`` is an ancestor of ``proposer_boost_root``
     if get_ancestor(store, store.proposer_boost_root, store.get_block(root).slot) == root:
-        committee_weight = get_total_active_balance(state) // config.SLOTS_PER_EPOCH
+        committee_weight = get_total_active_balance(state) // SLOTS_PER_EPOCH
         proposer_score = (committee_weight * config.PROPOSER_SCORE_BOOST) // 100
     return attestation_score + proposer_score
 
@@ -202,28 +219,42 @@ def get_voting_source(store: FCState, block_root: Root) -> Checkpoint:
     return get_actual_state(store, block_root).current_justified_checkpoint
 
 
-def filter_block_tree(store: FCState, block_root: Root, blocks: Dict[Root, BeaconBlock]) -> bool:
-    block = store.get_block(block_root)
-    children = [
-        hash_tree_root(b) for b in store.blocks
-        if b.parent_root == block_root
-    ]
+def make_tree(store: FCState, start: Root) -> Dict[Root, Sequence[Root]]:
+    res = {}
+    for b in store.blocks:
+        root = hash_tree_root(b)
+        parent_root = b.parent_root
+        if parent_root not in res:
+            res[parent_root] = []
+        res[parent_root].append(root)
+
+    res2 = {}
+    def shake(root: Root):
+        res2[root] = res.get(root, [])
+        for ch in res2[root]:
+            shake(ch)
+    shake(start)
+    return res2
+
+def filter_block_tree(store: FCState, block_root: Root, tree: Dict[Root,Sequence[Root]], blocks: Set[Root]) -> bool:
+    children = tree[block_root]
 
     # If any children branches contain expected finalized/justified checkpoints,
     # add to filtered block-tree and signal viability to parent.
     if any(children):
-        filter_block_tree_result = [filter_block_tree(store, child, blocks) for child in children]
-        if any(filter_block_tree_result):
-            blocks[block_root] = block
+        filtered_children = [child for child in children if filter_block_tree(store, child, tree, blocks)]
+        if any(filtered_children):
+            blocks.add(block_root)
             return True
-        return False
+        else:
+            return False
 
     current_epoch = compute_epoch_at_slot(get_current_slot(store))
     voting_source = get_voting_source(store, block_root)
 
     # The voting source should be at the same height as the store's justified checkpoint
     correct_justified = (
-            store.get_justified_checkpoint().epoch == config.GENESIS_EPOCH
+            store.get_justified_checkpoint().epoch == GENESIS_EPOCH
             or voting_source.epoch == store.get_justified_checkpoint().epoch
     )
 
@@ -247,40 +278,48 @@ def filter_block_tree(store: FCState, block_root: Root, blocks: Dict[Root, Beaco
     )
 
     # If expected finalized/justified, add to viable block-tree and signal viability to parent.
-    if correct_justified and correct_finalized:
-        blocks[block_root] = block
-        return True
-
-    # Otherwise, branch not viable
-    return False
+    res = correct_justified and correct_finalized
+    if res:
+        blocks.add(block_root)
+    return res
 
 
-def get_filtered_block_tree(store: FCState) -> Dict[Root, BeaconBlock]:
+def get_filtered_block_tree(store: FCState) -> Set[Root]:
     """
     Retrieve a filtered block tree from ``store``, only returning branches
     whose leaf state's justified/finalized info agrees with that in ``store``.
     """
     base = store.get_justified_checkpoint().root
-    blocks: Dict[Root, BeaconBlock] = {}
-    filter_block_tree(store, base, blocks)
+    tree = make_tree(store, base)
+    blocks: Set[Root] = set()
+    filter_block_tree(store, base, tree, blocks)
     return blocks
 
 
 def get_head(store: FCState) -> Root:
     # Get filtered block tree that only includes viable branches
+    base = store.get_justified_checkpoint().root
+    tree = make_tree(store, base)
     blocks = get_filtered_block_tree(store)
+    state = store.get_checkpoint_state(store.get_justified_checkpoint())
+    unslashed_and_active_indices = [
+        i for i in get_active_validator_indices(state, get_current_epoch(state))
+        if not state.validators[i].slashed
+    ]
+    weight_map = {block_root: get_weight(store, state, unslashed_and_active_indices, block_root) for block_root in blocks.keys()}
+    return get_head_(store, tree, blocks, weight_map)
+
+
+def get_head_(store: FCState, tree: Dict[Root, Sequence[Root]], blocks: Set[Root], weight_map: Dict[Root, Gwei]) -> Root:
     # Execute the LMD-GHOST fork choice
     head = store.get_justified_checkpoint().root
     while True:
-        children = [
-            root for root in blocks.keys()
-            if blocks[root].parent_root == head
-        ]
+        children = [child for child in tree[head] if child in blocks]
         if len(children) == 0:
             return head
         # Sort by latest attesting balance with ties broken lexicographically
         # Ties broken by favoring block with lexicographically higher root
-        head = max(children, key=lambda root: (get_weight(store, root), root))
+        head = max(children, key=lambda root: (weight_map[root], root))
 
 
 def on_tick_per_slot(store: FCState, time: uint64) -> FCState:
@@ -354,9 +393,9 @@ def update_on_tick(store: FCState, time: uint64) -> FCState:
     validate_tick(store, time)
     # If the ``store.time`` falls behind, while loop catches up slot by slot
     # to ensure that every previous slot is processed with ``on_tick_per_slot``
-    tick_slot = (time - store.genesis_time) // SECONDS_PER_SLOT
+    tick_slot = (time - store.genesis_time) // config.SECONDS_PER_SLOT
     while get_current_slot(store) < tick_slot:
-        previous_time = store.genesis_time + (get_current_slot(store) + 1) * SECONDS_PER_SLOT
+        previous_time = store.genesis_time + (get_current_slot(store) + 1) * config.SECONDS_PER_SLOT
         store = on_tick_per_slot(store, previous_time)
     return on_tick_per_slot(store, time)
 
@@ -390,8 +429,8 @@ def update_on_block(store: FCState, signed_block: SignedBeaconBlock) -> FCState:
     store = replace(store, blocks=(store.blocks | {block}))
 
     # Add proposer score boost if the block is timely
-    time_into_slot = (store.time - store.genesis_time) % SECONDS_PER_SLOT
-    is_before_attesting_interval = time_into_slot < SECONDS_PER_SLOT // INTERVALS_PER_SLOT
+    time_into_slot = (store.time - store.genesis_time) % config.SECONDS_PER_SLOT
+    is_before_attesting_interval = time_into_slot < config.SECONDS_PER_SLOT // INTERVALS_PER_SLOT
     if get_current_slot(store) == block.slot and is_before_attesting_interval:
         store = replace(store, proposer_boost_root=hash_tree_root(block))
 
