@@ -284,7 +284,7 @@ def filter_block_tree(store: FCState, block_root: Root, tree: Dict[Root,Sequence
     return res
 
 
-def get_filtered_block_tree(store: FCState) -> Set[Root]:
+def get_filtered_block_tree(store: FCState) -> (Mapping[Root, Sequence[Root]], Set[Root]):
     """
     Retrieve a filtered block tree from ``store``, only returning branches
     whose leaf state's justified/finalized info agrees with that in ``store``.
@@ -293,7 +293,7 @@ def get_filtered_block_tree(store: FCState) -> Set[Root]:
     tree = make_tree(store, base)
     blocks: Set[Root] = set()
     filter_block_tree(store, base, tree, blocks)
-    return blocks
+    return tree, blocks
 
 
 def get_head(store: FCState) -> Root:
@@ -306,15 +306,18 @@ def get_head(store: FCState) -> Root:
         i for i in get_active_validator_indices(state, get_current_epoch(state))
         if not state.validators[i].slashed
     ]
-    weight_map = {block_root: get_weight(store, state, unslashed_and_active_indices, block_root) for block_root in blocks.keys()}
-    return get_head_(store, tree, blocks, weight_map)
+    weight_map = {
+        block_root: get_weight(store, state, unslashed_and_active_indices, block_root)
+        for block_root in blocks
+    }
+    return get_head_(store, tree, weight_map)
 
 
-def get_head_(store: FCState, tree: Dict[Root, Sequence[Root]], blocks: Set[Root], weight_map: Dict[Root, Gwei]) -> Root:
+def get_head_(store: FCState, tree: Dict[Root, Sequence[Root]], weight_map: Dict[Root, Gwei]) -> Root:
     # Execute the LMD-GHOST fork choice
     head = store.get_justified_checkpoint().root
     while True:
-        children = [child for child in tree[head] if child in blocks]
+        children = [child for child in tree[head] if child in weight_map]
         if len(children) == 0:
             return head
         # Sort by latest attesting balance with ties broken lexicographically
