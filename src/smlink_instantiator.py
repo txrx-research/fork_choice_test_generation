@@ -20,48 +20,56 @@ def instantiate_test_case(sources, targets):
     def update_slot(target_slot):
         while get_current_slot(builder.store) < target_slot:
             builder.new_slot()
-    for epoch in sorted(set(sources).union(targets)):
+    for epoch in range(max(set(sources).union(targets)) + 1):
         match epoch:
             case 0:
                 pass
-            case int(n) if n in bounds:
-                min_b, max_b, idx = bounds[epoch]
-                src, tgt = sources[idx], epoch
-                if src in hidden:
-                    sb = hidden[src]
-                    builder.send_block(sb)
-                    del hidden[src]
-                update_slot(phase0.compute_start_slot_at_epoch(n))
-                boundary_block = builder.mk_block()
-                builder.send_block(boundary_block)
-                if min_b is not None:
-                    update_slot(phase0.compute_start_slot_at_epoch(n) + 1)
-                    if to_hide_at_next_epoch is not None:
-                        epoch_to_hide, atts_to_hide = to_hide_at_next_epoch
-                        hidden_block = builder.mk_block(atts=(atts_to_hide,))
-                        hidden[epoch_to_hide] = hidden_block
-                        to_hide_at_next_epoch = None
-                    update_slot(phase0.compute_start_slot_at_epoch(n) + 2)
-                    for i in [2,3,4,5,6]:
-                        update_slot(phase0.compute_start_slot_at_epoch(n) + i)
-                        atts = builder.mk_attestations()
-                        builder.send_attestation(atts)
-                    update_slot(phase0.compute_start_slot_at_epoch(n) + 7)
-                    atts = builder.mk_attestations()
-                    to_hide_at_next_epoch = (tgt, atts)
-                else:
-                    for i in range(8):
-                        update_slot(phase0.compute_start_slot_at_epoch(n) + i)
-                        if i == 1 and to_hide_at_next_epoch is not None:
+            case int(n):
+                if n in bounds:
+                    min_b, max_b, idx = bounds[epoch]
+                    src, tgt = sources[idx], epoch
+                    if src in hidden:
+                        sb = hidden[src]
+                        builder.send_block(sb)
+                        del hidden[src]
+                    update_slot(phase0.compute_start_slot_at_epoch(n))
+                    boundary_block = builder.mk_block()
+                    builder.send_block(boundary_block)
+                    if min_b is not None:
+                        update_slot(phase0.compute_start_slot_at_epoch(n) + 1)
+                        if to_hide_at_next_epoch is not None:
                             epoch_to_hide, atts_to_hide = to_hide_at_next_epoch
                             hidden_block = builder.mk_block(parent=atts_to_hide.data.beacon_block_root, atts=(atts_to_hide,))
                             hidden[epoch_to_hide] = hidden_block
                             to_hide_at_next_epoch = None
-                        if i == 7:
-                            sb = builder.mk_block()
-                            builder.send_block(sb)
+                        update_slot(phase0.compute_start_slot_at_epoch(n) + 2)
+                        for i in [2,3,4,5,6]:
+                            update_slot(phase0.compute_start_slot_at_epoch(n) + i)
+                            atts = builder.mk_attestations()
+                            builder.send_attestation(atts)
+                        update_slot(phase0.compute_start_slot_at_epoch(n) + 7)
                         atts = builder.mk_attestations()
-                        builder.send_attestation(atts)
+                        to_hide_at_next_epoch = (tgt, atts)
+                    else:
+                        for i in range(8):
+                            update_slot(phase0.compute_start_slot_at_epoch(n) + i)
+                            if i == 1 and to_hide_at_next_epoch is not None:
+                                epoch_to_hide, atts_to_hide = to_hide_at_next_epoch
+                                hidden_block = builder.mk_block(parent=atts_to_hide.data.beacon_block_root, atts=(atts_to_hide,))
+                                hidden[epoch_to_hide] = hidden_block
+                                to_hide_at_next_epoch = None
+                            if i == 7:
+                                sb = builder.mk_block()
+                                builder.send_block(sb)
+                            atts = builder.mk_attestations()
+                            builder.send_attestation(atts)
+                else:
+                    if to_hide_at_next_epoch is not None:
+                        update_slot(phase0.compute_start_slot_at_epoch(n) + 1)
+                        epoch_to_hide, atts_to_hide = to_hide_at_next_epoch
+                        hidden_block = builder.mk_block(parent=atts_to_hide.data.beacon_block_root, atts=(atts_to_hide,))
+                        hidden[epoch_to_hide] = hidden_block
+                        to_hide_at_next_epoch = None
             case _:
                 assert False
     builder.new_slot()
@@ -93,11 +101,11 @@ from time import perf_counter
 
 
 t0 = perf_counter()
-for case in cases:
+for i, case in enumerate(cases):
     sources = case['sources']
     targets = case['targets']
     tc = instantiate_test_case(sources, targets)
-    print('tc', to_readable(tc))
+    print(i, 'tc', to_readable(tc))
     run_tc(tc)
 t1 = perf_counter()
 print(t1-t0)
