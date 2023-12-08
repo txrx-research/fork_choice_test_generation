@@ -13,7 +13,7 @@ from eth2spec.phase0.minimal import (get_head, get_filtered_block_tree, get_weig
                                      on_attester_slashing, get_forkchoice_store, get_current_slot, state_transition,
                                      process_slots, get_beacon_proposer_index, compute_epoch_at_slot,
                                      get_checkpoint_block, get_voting_source, is_previous_epoch_justified,
-                                     get_current_epoch, get_active_validator_indices
+                                     get_current_epoch, get_previous_epoch, get_active_validator_indices
                                      )
 from eth2spec.phase0.minimal import hash_tree_root
 
@@ -85,7 +85,7 @@ class TCBuilder:
                 if block.slot == ref:
                     return root
             assert False
-        elif isinstance(ref, Root):
+        elif isinstance(ref, bytes) and len(ref) == 32:
             return ref
         else:
             assert False
@@ -109,8 +109,9 @@ class TCBuilder:
             for a in self.attestations:
                 assert isinstance(a, phase0.Attestation)
                 if (a.data.source == st.current_justified_checkpoint
-                    or a.data.source == st.previous_justified_checkpoint) \
-                        and (a.data.slot + phase0.MIN_ATTESTATION_INCLUSION_DELAY <= slot <= a.data.slot + phase0.SLOTS_PER_EPOCH):
+                            or a.data.source == st.previous_justified_checkpoint) \
+                        and (a.data.slot + phase0.MIN_ATTESTATION_INCLUSION_DELAY <= slot <= a.data.slot + phase0.SLOTS_PER_EPOCH)\
+                        and (a.data.target.epoch == get_current_epoch(st) or a.data.target.epoch == get_previous_epoch(st)):
                     selected_atts.append(a)
             for a in selected_atts:
                 block.body.attestations.append(a)
