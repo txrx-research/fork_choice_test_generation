@@ -1,6 +1,11 @@
 include "globals.mzn";
 
-set of int: BLOCKS = 0..7;
+int: NB; % num of blocks
+int: MD; % max depth
+int: MW; % max width
+int: MC; % max children
+
+set of int: BLOCKS = 0..(NB-1);
 
 array[BLOCKS] of var BLOCKS: parent;
 array[BLOCKS] of var set of BLOCKS: children;
@@ -27,6 +32,7 @@ constraint int_set_channel(parent, children);
 constraint forall(b in BLOCKS)(if b == 0 then depths[b] == 0 else depths[b] == depths[parent[b]] + 1 endif);
 
 constraint forall(b in BLOCKS)(if b != 0 then parent[b] < b else parent[b] == b endif);
-constraint forall(b in BLOCKS)(count_children(b) <= 2);
-constraint forall(b in BLOCKS)(depths[b] <= 5);
+constraint forall(b in BLOCKS)(count_children(b) <= MC);
+constraint forall(b in BLOCKS)(depths[b] <= MD);
 constraint forall(b in BLOCKS)(widths[b] == sub_tree_size(b));
+constraint forall(b in BLOCKS)(widths[b] <= MW);

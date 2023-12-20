@@ -22,6 +22,10 @@ def to_readable(tc: TC):
 block_tree = Model('../minizinc/Block_tree.mzn')
 gecode = Solver.lookup("gecode")
 instance = Instance(gecode, block_tree)
+instance['NB'] = 5
+instance['MC'] = 2
+instance['MD'] = 5
+instance['MW'] = 3
 
 
 results = instance.solve(all_solutions=True)
