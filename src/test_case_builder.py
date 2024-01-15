@@ -17,6 +17,8 @@ from eth2spec.phase0.minimal import (get_head, get_filtered_block_tree, get_weig
                                      )
 from eth2spec.phase0.minimal import hash_tree_root
 
+import eth2spec.utils.bls
+
 
 def do_spec_step(store, evt):
     match evt:
@@ -180,7 +182,7 @@ class TCBuilder:
             aggregation_bits=aggregation_bits,
             data=attestation_data,
         )
-        attestations_helper.fill_aggregate_attestation(phase0, state, attestation, signed=False, filter_participant_set=None)
+        attestations_helper.fill_aggregate_attestation(phase0, state, attestation, signed=eth2spec.utils.bls.bls_active, filter_participant_set=None)
 
         atts = attestation
         return atts
