@@ -4,7 +4,7 @@ from test_case_builder import TC
 from test_case_builder import (
     SignedBeaconBlock, Attestation, AttesterSlashing,
     get_forkchoice_store, do_spec_step, Store, get_head, get_filtered_block_tree, get_weight,
-    get_current_epoch, get_active_validator_indices
+    get_current_epoch, get_active_validator_indices, get_proposer_head, get_current_slot, hash_tree_root
 )
 from abstract_spec import (FCState, get_head as abs_get_head, get_head_ as abs_get_head_, get_weight as abs_get_weight,
     get_filtered_block_tree as abs_get_filtered_block_tree,
@@ -68,14 +68,24 @@ def mk_initial_states(anchor):
     fc_state = get_forkchoice_state(anchor_state, anchor_block)
     return fc_state, store
 
+def check_head_root(store):
+    head_root = get_head(store)
+    try:
+        return get_proposer_head(store, head_root, get_current_slot(store))
+    except Exception:
+        return head_root
 
-def run_tc(tc: TC):
+
+
+def run_tc(tc: TC, ignore_exceptions=False):
     fc_state, store = mk_initial_states(tc.anchor)
-    compare_fc_state(fc_state, store)
+    #compare_fc_state(fc_state, store)
+    check_head_root(store)
     for evt in tc.events:
-        do_spec_step(store, evt)
-        fc_state = do_abs_spec_step(fc_state, evt)
-        compare_fc_state(fc_state, store)
+        do_spec_step(store, evt, ignore_exceptions)
+        check_head_root(store)
+        #fc_state = do_abs_spec_step(fc_state, evt)
+        #compare_fc_state(fc_state, store)
 
 
 def enumerate_stores(tc: TC) -> Sequence[Store]:

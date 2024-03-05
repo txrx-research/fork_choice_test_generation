@@ -5,34 +5,28 @@ from typing import Any, Sequence, Set, Tuple, Dict, Optional
 from eth2spec.test.helpers import genesis, block as block_helpers, attestations as attestations_helper
 
 from eth2spec.phase0 import minimal as phase0
-from eth2spec.phase0.minimal import config, MAX_EFFECTIVE_BALANCE, GENESIS_SLOT, GENESIS_EPOCH
-from eth2spec.phase0.minimal import (Store, LatestMessage, Attestation, AttesterSlashing, BeaconState,
-                                     SignedBeaconBlock, BeaconBlock, Validator, Checkpoint, BeaconBlockBody,
-                                     AttestationData, Hash32, Root)
-from eth2spec.phase0.minimal import (get_head, get_filtered_block_tree, get_weight, on_tick, on_block, on_attestation,
-                                     on_attester_slashing, get_forkchoice_store, get_current_slot, state_transition,
-                                     process_slots, get_beacon_proposer_index, compute_epoch_at_slot,
-                                     get_checkpoint_block, get_voting_source, is_previous_epoch_justified,
-                                     get_current_epoch, get_previous_epoch, get_active_validator_indices
-                                     )
-from eth2spec.phase0.minimal import hash_tree_root
+from eth2spec.phase0.minimal import MAX_EFFECTIVE_BALANCE, get_previous_epoch
+from specs.phase0_minimal_fork_choice import *
 
 import eth2spec.utils.bls
 
 
-def do_spec_step(store, evt):
-    match evt:
-        case int(time):
-            on_tick(store, time)
-        case Attestation() as attestation:
-            on_attestation(store, attestation, False)
-        case SignedBeaconBlock() as signed_block:
-            on_block(store, signed_block)
-        case AttesterSlashing() as attester_slashing:
-            on_attester_slashing(store, attester_slashing)
-        case _:
-            assert False
-
+def do_spec_step(store, evt, ignore_exceptions=False):
+    try:
+        match evt:
+            case int(time):
+                on_tick(store, time)
+            case Attestation() as attestation:
+                on_attestation(store, attestation, False)
+            case SignedBeaconBlock() as signed_block:
+                on_block(store, signed_block)
+            case AttesterSlashing() as attester_slashing:
+                on_attester_slashing(store, attester_slashing)
+            case _:
+                assert False
+    except Exception as e:
+        if not ignore_exceptions:
+            raise
 
 def mk_anchor():
     no_validators = 16
@@ -47,6 +41,19 @@ def mk_anchor():
 class TC:
     anchor: Tuple[BeaconState, BeaconBlock]
     events: Sequence[int|SignedBeaconBlock|Attestation|AttesterSlashing]
+
+    def description(self):
+        res = []
+        for e in self.events:
+            match e:
+                case int(n):
+                    res.append(('tick', n))
+                case SignedBeaconBlock() as sb:
+                    res.append(('block', hash_tree_root(sb.message)))
+                case Attestation() as a:
+                    res.append(('attestation', a.data.source.epoch, a.data.target.epoch))
+        return res
+
 
 
 class TCBuilder:
@@ -138,21 +145,71 @@ class TCBuilder:
     #         target=Checkpoint(epoch=epoch, root=boundary_block))
     #     return Attestation(data=data)
 
-    def mk_attestations(self):
-        head_root = self._resolve_block_ref(None)
-        slot = get_current_slot(self.store)
-        state = self.store.block_states[head_root].copy()
+    def get_curr_state(self, root=None, slot=None):
+        if root is None:
+            root = self._resolve_block_ref(None)
+        if slot is None:
+            slot = get_current_slot(self.store)
+        state = self.store.block_states[root].copy()
         if state.slot < slot:
             phase0.process_slots(state, slot)
+        return state
 
-        block_root = head_root
-        current_epoch_start_slot = phase0.compute_start_slot_at_epoch(phase0.get_current_epoch(state))
+
+    def mk_single_attestation(self, vi, block_ref=None):
+        block_root = self._resolve_block_ref(block_ref)
+        state = self.get_curr_state(root=block_root)
+        committee, index, slot = phase0.get_committee_assignment(state, get_current_epoch(state), vi)
+
+        epoch = phase0.get_current_epoch(state)
+        current_epoch_start_slot = phase0.compute_start_slot_at_epoch(epoch)
         if slot < current_epoch_start_slot:
             epoch_boundary_root = phase0.get_block_root(state, phase0.get_previous_epoch(state))
         elif slot == current_epoch_start_slot:
             epoch_boundary_root = block_root
         else:
-            epoch_boundary_root = phase0.get_block_root(state, phase0.get_current_epoch(state))
+            epoch_boundary_root = phase0.get_block_root(state, epoch)
+
+        if slot < current_epoch_start_slot:
+            source_epoch = state.previous_justified_checkpoint.epoch
+            source_root = state.previous_justified_checkpoint.root
+        else:
+            source_epoch = state.current_justified_checkpoint.epoch
+            source_root = state.current_justified_checkpoint.root
+
+        attestation_data = phase0.AttestationData(
+            slot=slot,
+            index=index,
+            beacon_block_root=block_root,
+            source=phase0.Checkpoint(epoch=source_epoch, root=source_root),
+            target=phase0.Checkpoint(epoch=phase0.compute_epoch_at_slot(slot), root=epoch_boundary_root),
+        )
+
+
+        committee_size = len(committee)
+        aggregation_bits = phase0.Bitlist[phase0.MAX_VALIDATORS_PER_COMMITTEE](*([0] * committee_size))
+        attestation = phase0.Attestation(
+            aggregation_bits=aggregation_bits,
+            data=attestation_data,
+        )
+        attestations_helper.fill_aggregate_attestation(phase0, state, attestation, signed=eth2spec.utils.bls.bls_active,
+                                                       filter_participant_set=lambda participants: participants & {vi})
+        return attestation
+
+    def mk_attestations(self):
+        head_root = self._resolve_block_ref(None)
+        slot = get_current_slot(self.store)
+        state = self.get_curr_state(slot=slot,root=head_root)
+
+        block_root = head_root
+        epoch = phase0.get_current_epoch(state)
+        current_epoch_start_slot = phase0.compute_start_slot_at_epoch(epoch)
+        if slot < current_epoch_start_slot:
+            epoch_boundary_root = phase0.get_block_root(state, phase0.get_previous_epoch(state))
+        elif slot == current_epoch_start_slot:
+            epoch_boundary_root = block_root
+        else:
+            epoch_boundary_root = phase0.get_block_root(state, epoch)
 
         if slot < current_epoch_start_slot:
             source_epoch = state.previous_justified_checkpoint.epoch
@@ -194,5 +251,9 @@ class TCBuilder:
             self.events.append(att)
         else:
             self.pending_atts.append(att)
+
+    def send_slashing(self, slashing):
+        do_spec_step(self.store, slashing)
+        self.events.append(slashing)
 
 

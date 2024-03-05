@@ -1,8 +1,13 @@
+import ast
+import time
+
 from minzinc_gen import generate_sm_link_test_cases
 from test_case_builder import TC, TCBuilder, get_current_slot, hash_tree_root, phase0, SignedBeaconBlock, Attestation
 
 import eth2spec.utils.bls
 eth2spec.utils.bls.bls_active = False
+if eth2spec.utils.bls.bls_active:
+    eth2spec.utils.bls.use_fastest()
 
 
 def instantiate_test_case(sources, targets):
@@ -95,18 +100,39 @@ def to_readable(tc: TC):
 
 cases = generate_sm_link_test_cases()
 
-
 from test_case_runner import run_tc
 from time import perf_counter
 
+from cProfile import Profile
+from pstats import SortKey, Stats
 
+print("instantiating")
 t0 = perf_counter()
+tcs = []
 for i, case in enumerate(cases):
+    print(case)
     sources = case['sources']
     targets = case['targets']
     tc = instantiate_test_case(sources, targets)
     print(i, 'tc', to_readable(tc))
-    run_tc(tc)
+    tcs.append(tc)
 t1 = perf_counter()
 print(t1-t0)
+print("running")
+t2 = perf_counter()
+#with Profile() as profile:
+
+from mutation_operators import mutate_tc
+import random
+
+rnd = random.Random(123456798)
+
+for tc in tcs:
+    run_tc(tc)
+    for tc_ in mutate_tc(rnd, tc, 1):
+        run_tc(tc)
+
+#Stats(profile).sort_stats(SortKey.TIME).print_stats()
+t3 = perf_counter()
+print(t3-t2)
 

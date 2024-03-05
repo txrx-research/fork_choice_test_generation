@@ -5,20 +5,11 @@ from functools import cache
 
 from frozendict import frozendict
 
-from eth2spec.phase0 import minimal as phase0
-from eth2spec.phase0.minimal import config
-from eth2spec.phase0.minimal import GENESIS_SLOT, GENESIS_EPOCH, INTERVALS_PER_SLOT, SLOTS_PER_EPOCH
-from eth2spec.phase0.minimal import Slot, Epoch, Root, uint64, ValidatorIndex, Gwei
-from eth2spec.phase0.minimal import Checkpoint, BeaconState, SignedBeaconBlock, BeaconBlock, Attestation, AttesterSlashing
-from eth2spec.phase0.minimal import Store, LatestMessage
-from eth2spec.phase0.minimal import hash_tree_root
 from eth2spec.phase0.minimal import (process_slots as bc_process_slots, state_transition as bc_state_transition,
                                      process_justification_and_finalization as bc_process_justification_and_finalization,
-                                     get_current_epoch, compute_start_slot_at_epoch, compute_epoch_at_slot,
-                                     get_active_validator_indices, get_total_active_balance,
-                                     get_indexed_attestation, is_valid_indexed_attestation, is_slashable_attestation_data
                                      )
 
+from specs.phase0_minimal_fork_choice import *
 
 block_state_cache = {}
 state_transition_cache = {}
